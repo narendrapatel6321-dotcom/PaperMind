@@ -1,26 +1,9 @@
-"""Document ingestion and structure-aware chunking for the research-paper RAG system.
+"""Document ingestion and structure-aware chunking for PaperMind.
 
-The corpus consists of Marker-extracted research-paper ``.txt`` files.  Marker
-already preserves useful structure (Markdown headings, tables, figure captions,
-and page markers), so this module cleans those artifacts and turns the papers
-into retrieval-ready chunks while preserving provenance.
-
-Pipeline
---------
-TextFileLoader
-    -> loads raw paper files and basic paper metadata
-MarkerCleaner
-    -> removes Marker-only artifacts while preserving useful Markdown
-SectionParser
-    -> detects section headings and page boundaries
-StructureAwareChunker
-    -> creates paragraph/section-aware chunks with bounded overlap
-DocumentProcessor
-    -> orchestrates the complete ingestion process
-
-The public ``DocumentChunk`` / ``TextFileLoader`` / ``DocumentChunker`` names
-are retained for compatibility with the existing pipeline while the new
-``DocumentProcessor`` is the preferred interface going forward.
+The input corpus consists of research papers extracted to TXT with Marker.
+This module cleans Marker artifacts, detects paper structure, preserves useful
+scientific blocks (tables, captions and equations), and creates retrieval
+chunks with source/section/page metadata.
 """
 
 from __future__ import annotations
@@ -34,11 +17,13 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
 # Data models
+# ---------------------------------------------------------------------------
+
 @dataclass
 class RawDocument:
-    """A loaded source document with basic provenance."""
-
     text: str
     source: str
     path: str
@@ -47,8 +32,6 @@ class RawDocument:
 
 @dataclass
 class Section:
-    """A logical section of a research paper."""
-
     title: str
     text: str
     number: str | None = None
@@ -58,25 +41,29 @@ class Section:
 
 
 @dataclass
+class ContentBlock:
+    text: str
+    content_type: str = "text"
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+@dataclass
 class DocumentChunk:
-    """A retrieval-ready chunk with provenance metadata.
-
-    ``text`` is the content sent to the embedding model.  ``metadata`` keeps
-    information that should not be embedded, such as page numbers and section
-    names, but is needed later for source attribution.
-    """
-
     text: str
     source: str
     chunk_id: int
     metadata: dict[str, str] = field(default_factory=dict)
 
+
+# ---------------------------------------------------------------------------
 # Loading
+# ---------------------------------------------------------------------------
+
 class TextFileLoader:
-    """Load Marker-extracted ``.txt`` research papers from a directory."""
+    """Load all non-empty TXT research papers from a directory."""
 
     def load_documents(self, data_dir: Path) -> list[RawDocument]:
-        """Load all non-empty ``.txt`` files with basic metadata."""
         data_dir = Path(data_dir)
         if not data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {data_dir}")
@@ -84,7 +71,6 @@ class TextFileLoader:
             raise NotADirectoryError(f"Expected a directory: {data_dir}")
 
         documents: list[RawDocument] = []
-
         for path in sorted(data_dir.glob("*.txt")):
             try:
                 text = path.read_text(encoding="utf-8").strip()
@@ -96,128 +82,79 @@ class TextFileLoader:
                 logger.warning("Skipping empty document: %s", path.name)
                 continue
 
-            metadata = _extract_paper_metadata(text, path.stem)
             documents.append(
                 RawDocument(
                     text=text,
                     source=path.stem,
                     path=str(path),
-                    metadata=metadata,
+                    metadata=_extract_paper_metadata(text, path.stem),
                 )
-            )
-            logger.info(
-                "Loaded '%s' — %d characters", path.name, len(text)
             )
 
         logger.info("Loaded %d document(s) from %s", len(documents), data_dir)
         return documents
 
     def load(self, data_dir: Path) -> list[tuple[str, str]]:
-        """Backward-compatible loader returning ``(text, source)`` tuples.
+        """Backward-compatible interface used by the original project."""
+        return [(d.text, d.source) for d in self.load_documents(data_dir)]
 
-        The existing pipeline uses this interface.  New code should prefer
-        ``load_documents`` so metadata is retained.
-        """
-        return [
-            (document.text, document.source)
-            for document in self.load_documents(data_dir)
-        ]
 
-# Marker cleanup
+# ---------------------------------------------------------------------------
+# Marker cleaning
+# ---------------------------------------------------------------------------
+
 class MarkerCleaner:
-    """Clean recurring Marker extraction artifacts.
+    """Remove Marker-only syntax while preserving Markdown/scientific text."""
 
-    The cleaner deliberately does *not* strip Markdown headings, tables, or
-    figure captions because those structures are useful for retrieval.
-    """
-
-    _PAGE_MARKER_RE = re.compile(
+    PAGE_RE = re.compile(
         r"<span\s+id=[\"']page-(\d+)-\d+[\"']\s*>\s*</span>",
-        flags=re.IGNORECASE,
+        re.IGNORECASE,
     )
-    _HTML_TAG_RE = re.compile(r"</?(?!sup\b|sub\b|br\b)[a-zA-Z][^>]*>")
-    _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
-    _LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)")
-    _REFERENCE_LINK_RE = re.compile(r"\(#page-\d+-\d+\)")
-    _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-    _MULTINEWLINE_RE = re.compile(r"\n{3,}")
+    IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+    LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)")
+    HTML_TAG_RE = re.compile(
+        r"</?(?!sup\b|sub\b|br\b)[a-zA-Z][^>]*>", re.IGNORECASE
+    )
+    PAGE_ANCHOR_RE = re.compile(r"\(#page-\d+-\d+\)")
 
-    def clean(self, text: str) -> tuple[str, dict[int, int]]:
-        """Return cleaned text and a map of source page markers.
+    def clean(self, text: str) -> str:
+        def page_repl(match: re.Match[str]) -> str:
+            return f"\n<!-- PAGE:{match.group(1)} -->\n"
 
-        Page markers are removed from the text but converted into a mapping
-        from character position to page number.  The parser uses this mapping
-        to attach page provenance to chunks.
-        """
-        page_positions: dict[int, int] = {}
-
-        def record_page(match: re.Match[str]) -> str:
-            page = int(match.group(1))
-            page_positions[match.start()] = page
-            return f"\n<!-- PAGE:{page} -->\n"
-
-        text = self._PAGE_MARKER_RE.sub(record_page, text)
-
-        # Keep image captions, but remove the image syntax itself.
-        text = self._IMAGE_RE.sub("", text)
-
-        # Convert links to their visible text while retaining plain URLs.
-        text = self._LINK_RE.sub(r"\1", text)
-        text = self._REFERENCE_LINK_RE.sub("", text)
-
-        # Decode entities introduced by HTML extraction.
+        text = self.PAGE_RE.sub(page_repl, text)
+        text = self.IMAGE_RE.sub("", text)
+        text = self.LINK_RE.sub(r"\1", text)
+        text = self.PAGE_ANCHOR_RE.sub("", text)
         text = html.unescape(text)
-
-        # Remove ordinary HTML tags but retain <sup>/<sub>/<br> because they
-        # can carry useful mathematical structure.
-        text = self._HTML_TAG_RE.sub("", text)
+        text = self.HTML_TAG_RE.sub("", text)
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
 
-        # Normalize a few common extraction artifacts.
+        # Common Marker/mailto artifacts.
+        text = re.sub(r"\[([^\]]+)\]\(mailto\\?:[^)]*\)", r"\1", text)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = text.replace("\u00a0", " ")
         text = re.sub(r"[ \t]+\n", "\n", text)
-        text = self._MULTISPACE_RE.sub(" ", text)
-        text = self._MULTINEWLINE_RE.sub("\n\n", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
-        return text.strip(), page_positions
 
+# ---------------------------------------------------------------------------
 # Section parsing
-@dataclass
-class _ParsedBlock:
-    """Internal block representation used before chunking."""
-
-    text: str
-    section: str
-    section_number: str | None
-    level: int
-    page_start: int | None
-    page_end: int | None
-    content_type: str = "text"
-
+# ---------------------------------------------------------------------------
 
 class SectionParser:
-    """Parse Markdown-style paper sections and page boundaries."""
+    """Detect Markdown, numbered, uppercase and simple bold headings."""
 
-    _HEADING_RE = re.compile(
-        r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$"
+    MD_RE = re.compile(r"^(#{1,6})\s*(.*?)\s*$")
+    NUMBERED_RE = re.compile(
+        r"^(\d+(?:\.\d+)*)(?:[.)])?\s+([A-Za-z][^\n]{1,120})$"
     )
-    _PAGE_RE = re.compile(r"^\s*<!--\s*PAGE:(\d+)\s*-->\s*$")
-    _NUMBERED_SECTION_RE = re.compile(
-        r"^(?P<number>(?:\d+\.)*\d+)\s+(?P<title>.+)$"
-    )
-    _REFERENCES_RE = re.compile(
-        r"^(?:references|bibliography)\s*$", re.IGNORECASE
-    )
+    UPPER_RE = re.compile(r"^[A-Z][A-Z0-9\s:,&'()/+\-]{2,100}$")
+    BOLD_RE = re.compile(r"^\*\*([^*]{2,120})\*\*$")
 
     def parse(self, text: str) -> list[Section]:
-        """Convert cleaned text into logical sections.
-
-        Content before the first heading is retained as ``Front Matter``.
-        """
-        lines = text.splitlines()
         sections: list[Section] = []
-
         current_title = "Front Matter"
         current_number: str | None = None
         current_level = 1
@@ -241,75 +178,268 @@ class SectionParser:
                 )
             current_lines = []
 
-        for line in lines:
-            page_match = self._PAGE_RE.match(line)
-            if page_match:
-                page = int(page_match.group(1))
+        for raw in text.splitlines():
+            line = raw.strip()
+            page = re.fullmatch(r"<!--\s*PAGE:(\d+)\s*-->", line)
+            if page:
+                page_no = int(page.group(1))
                 if current_page_start is None:
-                    current_page_start = page
-                current_page_end = page
+                    current_page_start = page_no
+                current_page_end = page_no
+                # Keep the marker as a boundary for block-level page tracking.
+                current_lines.append(line)
                 continue
 
-            heading_match = self._HEADING_RE.match(line)
-            if heading_match:
+            heading = self._parse_heading(line)
+            if heading is not None:
                 flush()
-                title = heading_match.group("title").strip()
-                level = len(heading_match.group("marks"))
-                number, clean_title = self._split_section_number(title)
-
-                current_title = clean_title
+                title, number, level = heading
+                current_title = title
                 current_number = number
                 current_level = level
                 current_page_start = current_page_end
                 continue
 
-            current_lines.append(line)
+            current_lines.append(raw)
 
         flush()
         return sections
 
-    def _split_section_number(
-        self, title: str
-    ) -> tuple[str | None, str]:
-        match = self._NUMBERED_SECTION_RE.match(title)
-        if match:
-            return match.group("number"), match.group("title").strip()
-        return None, title
+    def _parse_heading(self, line: str) -> tuple[str, str | None, int] | None:
+        if not line:
+            return None
 
-# Structure-aware chunking
-class StructureAwareChunker:
-    """Create chunks from sections without cutting paragraphs unnecessarily.
+        md = self.MD_RE.match(line)
+        if md:
+            title = md.group(2).strip()
+            if not title:
+                return None
+            number, title = _split_section_number(title)
+            return title, number, len(md.group(1))
 
-    ``target_chars`` is a target rather than a hard limit.  A block that is
-    already larger than ``max_chars`` is split at sentence/word boundaries.
-    Tables are kept together whenever possible.
-    """
+        numbered = self.NUMBERED_RE.match(line)
+        if numbered and self._reasonable_heading(numbered.group(2)):
+            return numbered.group(2).strip(), numbered.group(1), 2
 
-    _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
-    _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
-    _FIGURE_CAPTION_RE = re.compile(
-        r"^\s*(?:Figure|Fig\.|Table)\s+\d+[:.]",
-        re.IGNORECASE,
+        bold = self.BOLD_RE.match(line)
+        if bold:
+            title = bold.group(1).strip()
+            # Avoid treating labels such as **Original input:** as sections.
+            if not title.endswith(":") and self._reasonable_heading(title):
+                number, title = _split_section_number(title)
+                return title, number, 2
+
+        if (
+            self.UPPER_RE.match(line)
+            and len(line) <= 100
+            and not line.endswith(".")
+        ):
+            return line, None, 1
+
+        return None
+
+    @staticmethod
+    def _reasonable_heading(text: str) -> bool:
+        if not text or len(text) > 120:
+            return False
+        if text.endswith(".") and len(text.split()) > 8:
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Front matter
+# ---------------------------------------------------------------------------
+
+class FrontMatterFilter:
+    """Remove author/affiliation/email noise before the abstract."""
+
+    EMAIL_RE = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+    URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
+    AFFILIATION_TERMS = (
+        "university", "institute", "laboratory", "department", "nvidia",
+        "google", "microsoft", "openai", "facebook", "meta", "ibm",
     )
-    _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+
+    def filter(self, sections: list[Section]) -> list[Section]:
+        result: list[Section] = []
+        for section in sections:
+            if section.title != "Front Matter":
+                result.append(section)
+                continue
+
+            kept: list[str] = []
+            for paragraph in re.split(r"\n\s*\n", section.text):
+                p = paragraph.strip()
+                if not p or self._is_noise(p):
+                    continue
+                kept.append(p)
+
+            if kept:
+                result.append(
+                    Section(
+                        title=section.title,
+                        text="\n\n".join(kept),
+                        number=section.number,
+                        level=section.level,
+                        page_start=section.page_start,
+                        page_end=section.page_end,
+                    )
+                )
+        return result
+
+    def _is_noise(self, text: str) -> bool:
+        compact = " ".join(text.split())
+        if re.fullmatch(r"#{1,6}", compact):
+            return True
+        if self.EMAIL_RE.search(compact):
+            return True
+        if self.URL_RE.fullmatch(compact):
+            return True
+
+        words = compact.split()
+        lower = compact.lower()
+        if len(words) <= 12 and any(term in lower for term in self.AFFILIATION_TERMS):
+            # Preserve actual sentences that merely mention an institution.
+            if not re.search(r"[.!?]", compact):
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Block extraction
+# ---------------------------------------------------------------------------
+
+class BlockExtractor:
+    """Extract paragraphs, tables, captions and page-aware blocks."""
+
+    TABLE_SEPARATOR_RE = re.compile(
+        r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+    )
+    TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+    CAPTION_RE = re.compile(
+        r"^\s*(?:Figure|Fig\.|Table)\s+\d+[:.]", re.IGNORECASE
+    )
+
+    def extract(self, section: Section) -> list[ContentBlock]:
+        lines = section.text.splitlines()
+        blocks: list[ContentBlock] = []
+        current: list[str] = []
+        current_page: int | None = section.page_start
+
+        def flush() -> None:
+            nonlocal current
+            text = "\n".join(current).strip()
+            current = []
+            if not text:
+                return
+            if self._is_noise(text):
+                return
+            blocks.append(
+                ContentBlock(
+                    text=text,
+                    content_type="text",
+                    page_start=current_page,
+                    page_end=current_page,
+                )
+            )
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            page = re.fullmatch(r"<!--\s*PAGE:(\d+)\s*-->", line)
+            if page:
+                flush()
+                current_page = int(page.group(1))
+                i += 1
+                continue
+
+            if (
+                i + 1 < len(lines)
+                and self.TABLE_ROW_RE.match(line)
+                and self.TABLE_SEPARATOR_RE.match(lines[i + 1].strip())
+            ):
+                flush()
+                table_lines = [line, lines[i + 1].strip()]
+                i += 2
+                while i < len(lines) and self.TABLE_ROW_RE.match(lines[i].strip()):
+                    table_lines.append(lines[i].strip())
+                    i += 1
+                blocks.append(
+                    ContentBlock(
+                        text="\n".join(table_lines),
+                        content_type="table",
+                        page_start=current_page,
+                        page_end=current_page,
+                    )
+                )
+                continue
+
+            if self.CAPTION_RE.match(line):
+                flush()
+                blocks.append(
+                    ContentBlock(
+                        text=line,
+                        content_type="caption",
+                        page_start=current_page,
+                        page_end=current_page,
+                    )
+                )
+                i += 1
+                continue
+
+            if not line:
+                flush()
+                i += 1
+                continue
+
+            current.append(lines[i])
+            i += 1
+
+        flush()
+        return blocks
+
+    @staticmethod
+    def _is_noise(text: str) -> bool:
+        compact = " ".join(text.split())
+        if not compact:
+            return True
+        if re.fullmatch(r"#{1,6}", compact):
+            return True
+        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", compact):
+            return True
+        if re.fullmatch(r"(?:https?://|www\.)\S+", compact, re.IGNORECASE):
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Chunk assembly
+# ---------------------------------------------------------------------------
+
+class StructureAwareChunker:
+    """Assemble natural content blocks into bounded retrieval chunks."""
 
     def __init__(
         self,
-        target_chars: int = 1800,
-        max_chars: int = 2600,
-        overlap_chars: int = 250,
+        target_chars: int = 1500,
+        max_chars: int = 2400,
+        overlap_chars: int = 200,
+        min_chunk_chars: int = 150,
         exclude_references: bool = True,
     ) -> None:
-        if target_chars <= 0:
-            raise ValueError("target_chars must be positive")
-        if max_chars < target_chars:
-            raise ValueError("max_chars must be >= target_chars")
+        if target_chars <= 0 or max_chars < target_chars:
+            raise ValueError("Require 0 < target_chars <= max_chars")
         if overlap_chars < 0 or overlap_chars >= target_chars:
             raise ValueError("overlap_chars must be >= 0 and < target_chars")
+        if min_chunk_chars < 0:
+            raise ValueError("min_chunk_chars must be >= 0")
 
         self.target_chars = target_chars
         self.max_chars = max_chars
         self.overlap_chars = overlap_chars
+        self.min_chunk_chars = min_chunk_chars
         self.exclude_references = exclude_references
 
     def chunk_sections(
@@ -318,291 +448,268 @@ class StructureAwareChunker:
         source: str,
         base_metadata: dict[str, str] | None = None,
     ) -> list[DocumentChunk]:
-        """Chunk parsed sections while preserving section/page provenance."""
         chunks: list[DocumentChunk] = []
-        chunk_id = 0
         base_metadata = dict(base_metadata or {})
+        chunk_id = 0
+        extractor = BlockExtractor()
 
         for section in sections:
-            if self.exclude_references and self._is_references(section):
-                logger.debug("Excluded References section from '%s'", source)
+            normalized_title = section.title.strip().lower()
+            if self.exclude_references and normalized_title in {
+                "references", "bibliography", "references and notes",
+            }:
+                continue
+            if normalized_title in {"acknowledgements", "acknowledgments", "contents"}:
                 continue
 
-            blocks = self._split_into_blocks(section.text)
+            blocks = extractor.extract(section)
+            assembled = self._assemble(blocks)
 
-            for block_text, content_type in blocks:
-                for piece in self._pack_block(block_text):
-                    if not piece.strip():
-                        continue
+            for text, types, page_start, page_end in assembled:
+                if not text.strip():
+                    continue
 
-                    metadata = {
-                        **base_metadata,
-                        "section": section.title,
-                        "section_level": str(section.level),
-                        "content_type": content_type,
-                    }
+                metadata = {
+                    **base_metadata,
+                    "section": section.title,
+                    "section_level": str(section.level),
+                    "content_type": self._content_type(types),
+                }
+                if section.number:
+                    metadata["section_number"] = section.number
+                if page_start is not None:
+                    metadata["page_start"] = str(page_start)
+                if page_end is not None:
+                    metadata["page_end"] = str(page_end)
 
-                    if section.number:
-                        metadata["section_number"] = section.number
-                    if section.page_start is not None:
-                        metadata["page_start"] = str(section.page_start)
-                    if section.page_end is not None:
-                        metadata["page_end"] = str(section.page_end)
-
-                    chunks.append(
-                        DocumentChunk(
-                            text=piece.strip(),
-                            source=source,
-                            chunk_id=chunk_id,
-                            metadata=metadata,
-                        )
+                chunks.append(
+                    DocumentChunk(
+                        text=text.strip(),
+                        source=source,
+                        chunk_id=chunk_id,
+                        metadata=metadata,
                     )
-                    chunk_id += 1
+                )
+                chunk_id += 1
 
-        logger.info("'%s' → %d structure-aware chunks", source, len(chunks))
+        logger.info("%s -> %d chunks", source, len(chunks))
         return chunks
 
-    def _is_references(self, section: Section) -> bool:
-        return section.title.strip().lower() in {
-            "references",
-            "bibliography",
-        }
+    def _assemble(self, blocks: list[ContentBlock]):
+        """Pack blocks until target size; never split a natural block."""
+        results = []
+        current: list[ContentBlock] = []
+        current_len = 0
 
-    def _split_into_blocks(self, text: str) -> list[tuple[str, str]]:
-        """Split section text into paragraphs, tables, and captions."""
-        lines = text.splitlines()
-        blocks: list[tuple[str, str]] = []
-        current: list[str] = []
-        in_table = False
-
-        def flush_text() -> None:
-            nonlocal current
-            content = "\n".join(current).strip()
-            if content:
-                blocks.append((content, "text"))
+        def flush() -> None:
+            nonlocal current, current_len
+            if not current:
+                return
+            text = "\n\n".join(b.text.strip() for b in current if b.text.strip())
+            if text:
+                results.append((
+                    text,
+                    [b.content_type for b in current],
+                    current[0].page_start,
+                    current[-1].page_end,
+                ))
             current = []
+            current_len = 0
 
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # Markdown table: header + separator + subsequent table rows.
-            if (
-                i + 1 < len(lines)
-                and self._TABLE_ROW_RE.match(line)
-                and self._TABLE_SEPARATOR_RE.match(lines[i + 1])
-            ):
-                flush_text()
-                table = [line, lines[i + 1]]
-                i += 2
-                while i < len(lines) and self._TABLE_ROW_RE.match(lines[i]):
-                    table.append(lines[i])
-                    i += 1
-                blocks.append(("\n".join(table).strip(), "table"))
+        for block in blocks:
+            text = block.text.strip()
+            if not text:
                 continue
 
-            if not line.strip():
-                flush_text()
-                i += 1
+            # Oversized atomic block: preserve as much as possible, then fall
+            # back to a word boundary split.
+            if len(text) > self.max_chars and block.content_type == "table":
+                flush()
+                for piece in self._split_long_text(text):
+                    results.append((piece, ["table"], block.page_start, block.page_end))
                 continue
 
-            if self._FIGURE_CAPTION_RE.match(line):
-                flush_text()
-                blocks.append((line.strip(), "caption"))
-                i += 1
-                continue
+            added = len(text) + (2 if current else 0)
+            if current and current_len + added > self.max_chars:
+                flush()
 
-            current.append(line)
-            i += 1
+            current.append(block)
+            current_len += len(text) + (2 if len(current) > 1 else 0)
 
-        flush_text()
-        return blocks
+            # Stop only at block boundaries. This is the key difference from
+            # the old fixed-character chunker.
+            if current_len >= self.target_chars:
+                flush()
 
-    def _pack_block(self, block: str) -> list[str]:
-        """Pack text into target-sized pieces using sentence boundaries."""
-        block = block.strip()
-        if len(block) <= self.max_chars:
-            return [block]
+        flush()
+        return self._merge_short(results)
 
-        # Tables should not be arbitrarily split if possible.
-        if self._TABLE_ROW_RE.match(block.splitlines()[0]):
-            return self._split_hard(block)
+    def _merge_short(self, chunks):
+        """Merge short chunks with neighbors instead of deleting them."""
+        if not chunks:
+            return []
 
-        sentences = self._SENTENCE_RE.split(block)
-        pieces: list[str] = []
-        current = ""
+        merged = []
+        for chunk in chunks:
+            text, types, start, end = chunk
+            if merged and len(text) < self.min_chunk_chars:
+                prev_text, prev_types, prev_start, prev_end = merged[-1]
+                if len(prev_text) + len(text) + 2 <= self.max_chars:
+                    merged[-1] = (
+                        prev_text + "\n\n" + text,
+                        prev_types + types,
+                        prev_start,
+                        end or prev_end,
+                    )
+                    continue
+            merged.append(chunk)
 
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
+        # Handle a short first chunk by merging forward.
+        if len(merged) >= 2 and len(merged[0][0]) < self.min_chunk_chars:
+            first, second = merged[0], merged[1]
+            if len(first[0]) + len(second[0]) + 2 <= self.max_chars:
+                merged = [(
+                    first[0] + "\n\n" + second[0],
+                    first[1] + second[1],
+                    first[2] or second[2],
+                    second[3] or first[3],
+                )] + merged[2:]
 
-            candidate = (
-                sentence if not current else f"{current} {sentence}"
-            )
+        return merged
 
-            if len(candidate) <= self.target_chars:
-                current = candidate
-                continue
-
-            if current:
-                pieces.append(current)
-
-            if len(sentence) <= self.max_chars:
-                current = sentence
-            else:
-                pieces.extend(self._split_hard(sentence))
-                current = ""
-
-        if current:
-            pieces.append(current)
-
-        return self._add_overlap(pieces)
-
-    def _split_hard(self, text: str) -> list[str]:
-        """Fallback split for unusually long paragraphs/equations/tables."""
+    def _split_long_text(self, text: str) -> list[str]:
         words = text.split()
         pieces: list[str] = []
         current: list[str] = []
         current_len = 0
 
         for word in words:
-            added_len = len(word) + (1 if current else 0)
-            if current and current_len + added_len > self.max_chars:
+            added = len(word) + (1 if current else 0)
+            if current and current_len + added > self.max_chars:
                 pieces.append(" ".join(current))
                 current = []
                 current_len = 0
-
             current.append(word)
-            current_len += added_len
+            current_len += added
 
         if current:
             pieces.append(" ".join(current))
+        return pieces
 
-        return self._add_overlap(pieces)
+    @staticmethod
+    def _content_type(types: list[str]) -> str:
+        unique = list(dict.fromkeys(types))
+        return unique[0] if len(unique) == 1 else "mixed"
 
-    def _add_overlap(self, pieces: list[str]) -> list[str]:
-        """Carry a small tail of the previous piece into the next piece."""
-        if self.overlap_chars == 0 or len(pieces) < 2:
-            return pieces
 
-        result = [pieces[0]]
-        for piece in pieces[1:]:
-            tail = result[-1][-self.overlap_chars:].strip()
-            result.append(f"{tail}\n{piece}".strip() if tail else piece)
-
-        return result
-
+# ---------------------------------------------------------------------------
 # High-level processor
+# ---------------------------------------------------------------------------
+
 class DocumentProcessor:
-    """End-to-end processor for the research-paper corpus."""
+    """Process a directory of Marker TXT papers into retrieval chunks."""
 
     def __init__(
         self,
-        target_chars: int = 1800,
-        max_chars: int = 2600,
-        overlap_chars: int = 250,
+        target_chars: int = 1500,
+        max_chars: int = 2400,
+        overlap_chars: int = 200,
+        min_chunk_chars: int = 150,
         exclude_references: bool = True,
     ) -> None:
         self.loader = TextFileLoader()
         self.cleaner = MarkerCleaner()
         self.parser = SectionParser()
+        self.front_matter = FrontMatterFilter()
         self.chunker = StructureAwareChunker(
             target_chars=target_chars,
             max_chars=max_chars,
             overlap_chars=overlap_chars,
+            min_chunk_chars=min_chunk_chars,
             exclude_references=exclude_references,
         )
 
     def process_directory(self, data_dir: Path) -> list[DocumentChunk]:
-        """Process every paper in ``data_dir`` into retrieval-ready chunks."""
         documents = self.loader.load_documents(data_dir)
-
         if not documents:
             raise FileNotFoundError(
                 f"No non-empty .txt documents found in '{data_dir}'."
             )
 
         all_chunks: list[DocumentChunk] = []
-
         for document in documents:
-            cleaned_text, _ = self.cleaner.clean(document.text)
-            sections = self.parser.parse(cleaned_text)
+            cleaned = self.cleaner.clean(document.text)
+            sections = self.parser.parse(cleaned)
+            sections = self.front_matter.filter(sections)
 
-            chunks = self.chunker.chunk_sections(
-                sections,
-                source=document.source,
-                base_metadata={
-                    **document.metadata,
-                    "source_file": Path(document.path).name,
-                },
+            all_chunks.extend(
+                self.chunker.chunk_sections(
+                    sections,
+                    source=document.source,
+                    base_metadata={
+                        **document.metadata,
+                        "source_file": Path(document.path).name,
+                    },
+                )
             )
-            all_chunks.extend(chunks)
 
         logger.info(
-            "Processed %d document(s) → %d total chunks",
+            "Processed %d document(s) -> %d total chunks",
             len(documents),
             len(all_chunks),
         )
         return all_chunks
 
+
+# ---------------------------------------------------------------------------
 # Backward-compatible wrapper
+# ---------------------------------------------------------------------------
+
 class DocumentChunker:
-    """Compatibility wrapper around ``StructureAwareChunker``.
+    """Compatibility wrapper for the original public API."""
 
-    New code should use ``DocumentProcessor``.  This class remains so the
-    existing pipeline does not immediately break while we migrate it.
-    """
-
-    def __init__(
-        self,
-        chunk_size: int = 1800,
-        chunk_overlap: int = 250,
-    ) -> None:
-        self._chunker = StructureAwareChunker(
+    def __init__(self, chunk_size: int = 1500, chunk_overlap: int = 200):
+        self._processor = DocumentProcessor(
             target_chars=chunk_size,
-            max_chars=chunk_size,
+            max_chars=max(chunk_size, 2400),
             overlap_chars=min(chunk_overlap, max(0, chunk_size // 4)),
-            exclude_references=False,
+            min_chunk_chars=150,
         )
 
     def chunk(self, text: str, source: str) -> list[DocumentChunk]:
-        """Chunk raw text using the new structure-aware implementation."""
-        cleaner = MarkerCleaner()
-        parser = SectionParser()
+        cleaned = self._processor.cleaner.clean(text)
+        sections = self._processor.front_matter.filter(
+            self._processor.parser.parse(cleaned)
+        )
+        return self._processor.chunker.chunk_sections(sections, source)
 
-        cleaned_text, _ = cleaner.clean(text)
-        sections = parser.parse(cleaned_text)
 
-        return self._chunker.chunk_sections(sections, source)
-
+# ---------------------------------------------------------------------------
 # Metadata helpers
+# ---------------------------------------------------------------------------
+
 def _extract_paper_metadata(text: str, source: str) -> dict[str, str]:
-    """Extract lightweight metadata from the beginning of a paper.
-
-    This intentionally uses conservative heuristics.  If a field cannot be
-    identified confidently, it is omitted rather than guessed.
-    """
-    metadata: dict[str, str] = {}
-
+    metadata = {"source_id": source}
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return metadata
 
-    # First Markdown heading is usually the title in Marker output.
-    for line in lines[:15]:
+    for line in lines[:20]:
         if line.startswith("# "):
-            title = re.sub(r"^#\s+", "", line).strip()
+            title = line[2:].strip()
             if title:
                 metadata["title"] = title
             break
 
-    # Keep source as a stable fallback identifier.
-    metadata["source_id"] = source
-
-    # Conservative year detection from the filename/source.
-    year_match = re.search(r"\b(19|20)\d{2}\b", source)
-    if year_match:
-        metadata["year"] = year_match.group(0)
+    year = re.search(r"\b(19|20)\d{2}\b", source)
+    if year:
+        metadata["year"] = year.group(0)
 
     return metadata
+
+
+def _split_section_number(title: str) -> tuple[str | None, str]:
+    match = re.match(
+        r"^(\d+(?:\.\d+)*)(?:[.)])?\s+(.+)$", title.strip()
+    )
+    if match:
+        return match.group(1), match.group(2).strip()
+    return None, title.strip()
