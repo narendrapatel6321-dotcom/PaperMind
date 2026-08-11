@@ -51,6 +51,7 @@ class DocumentChunk:
     chunk_id: int
     metadata: dict[str, str] = field(default_factory=dict)
 
+# Loading
 class TextFileLoader:
     """Load all non-empty TXT research papers from a directory."""
 
@@ -292,6 +293,58 @@ class FrontMatterFilter:
 
 # Block extraction
 class BlockExtractor:
+
+    _REFERENCE_ENTRY_RE = re.compile(
+        r"""^\s*(?:\[\s*\d+\s*\]|\d+\.?\s+).{20,}
+        (?:\b(?:19|20)\d{2}\b|\barXiv\b|\bdoi\b|
+        \bProceedings\b|\bJournal\b|\bNeurIPS\b|\bICLR\b|
+        \bICML\b|\bACL\b|\bCVPR\b|\bECCV\b|\bEMNLP\b|
+        \bNAACL\b|\bAAAI\b|\bJMLR\b)
+        """,
+        flags=re.IGNORECASE | re.VERBOSE,
+    )
+
+    _REFERENCE_HEADING_RE = re.compile(
+        r"^(?:references|bibliography|references and notes)$",
+        flags=re.IGNORECASE,
+    )
+
+    def remove_reference_tail(
+        self,
+        blocks: list[ContentBlock],
+    ) -> list[ContentBlock]:
+        """Remove bibliography tails when no explicit References section exists.
+
+        Several consecutive bibliography-like entries are required to reduce
+        false positives from ordinary scientific prose.
+        """
+        if not blocks:
+            return blocks
+
+        consecutive_refs = 0
+
+        for i, block in enumerate(blocks):
+            if self._looks_like_reference_entry(block.text):
+                consecutive_refs += 1
+                if consecutive_refs >= 3:
+                    return blocks[: i - 2]
+            else:
+                consecutive_refs = 0
+
+        return blocks
+
+    @classmethod
+    def _looks_like_reference_entry(cls, text: str) -> bool:
+        compact = " ".join(text.split())
+
+        if cls._REFERENCE_HEADING_RE.fullmatch(compact):
+            return True
+
+        if len(compact) < 30:
+            return False
+
+        return bool(cls._REFERENCE_ENTRY_RE.match(compact))
+
     """Extract paragraphs, tables, captions and page-aware blocks."""
 
     TABLE_SEPARATOR_RE = re.compile(
@@ -396,7 +449,6 @@ class BlockExtractor:
             return True
         return False
 
-
 # Section-title normalization
 def _normalize_section_title(title: str) -> str:
     """Normalize Markdown formatting for section comparisons and metadata."""
@@ -451,6 +503,12 @@ class StructureAwareChunker:
                 continue
 
             blocks = extractor.extract(section)
+            # Marker does not always expose the bibliography as a separate
+            # References section. Remove a reference tail when several
+            # consecutive bibliography-like entries appear.
+            if self.exclude_references:
+                blocks = extractor.remove_reference_tail(blocks)
+
             assembled = self._assemble(blocks)
 
             for text, types, page_start, page_end in assembled:
@@ -724,7 +782,6 @@ def _extract_paper_metadata(text: str, source: str) -> dict[str, str]:
         metadata["year"] = year.group(0)
 
     return metadata
-
 
 def _split_section_number(title: str) -> tuple[str | None, str]:
     match = re.match(
