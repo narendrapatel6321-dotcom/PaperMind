@@ -260,8 +260,8 @@ class FrontMatterFilter:
         "university", "institute", "laboratory", "department", "nvidia",
         "google", "microsoft", "openai", "facebook", "meta", "ibm",
     )
-
-    def filter(self, sections: list[Section]) -> list[Section]:
+    
+    def filter(self, sections: list[Section], title: str | None = None, ) -> list[Section]:
         result: list[Section] = []
         for section in sections:
             if section.title != "Front Matter":
@@ -271,7 +271,14 @@ class FrontMatterFilter:
             kept: list[str] = []
             for paragraph in re.split(r"\n\s*\n", section.text):
                 p = paragraph.strip()
-                if not p or self._is_noise(p):
+
+                if not p:
+                    continue
+
+                if title and " ".join(p.split()) == " ".join(title.split()):
+                    continue
+
+                if self._is_noise(p):
                     continue
                 kept.append(p)
 
@@ -288,21 +295,33 @@ class FrontMatterFilter:
                 )
         return result
 
-    def _is_noise(self, text: str) -> bool:
+    @staticmethod
+    def _is_noise(text: str) -> bool:
         compact = " ".join(text.split())
-        if re.fullmatch(r"#{1,6}", compact):
-            return True
-        if self.EMAIL_RE.search(compact):
-            return True
-        if self.URL_RE.fullmatch(compact):
+
+        if not compact:
             return True
 
-        words = compact.split()
-        lower = compact.lower()
-        if len(words) <= 12 and any(term in lower for term in self.AFFILIATION_TERMS):
-            # Preserve actual sentences that merely mention an institution.
-            if not re.search(r"[.!?]", compact):
-                return True
+        # Isolated Markdown artifacts.
+        if re.fullmatch(r"#{1,6}", compact):
+            return True
+
+        # Isolated punctuation / table remnants.
+        if re.fullmatch(r"[-–—|*_~•·.]+", compact):
+            return True
+
+        # Isolated email.
+        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", compact):
+            return True
+
+        # Isolated URL.
+        if re.fullmatch(
+            r"(?:https?://|www\.)\S+",
+            compact,
+            re.IGNORECASE,
+        ):
+            return True
+
         return False
 
 
@@ -417,6 +436,12 @@ class BlockExtractor:
 # ---------------------------------------------------------------------------
 # Chunk assembly
 # ---------------------------------------------------------------------------
+def _normalize_section_title(title: str) -> str:
+    """Normalize formatting for section comparisons and metadata."""
+    title = re.sub(r"[*_`]+", "", title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
+
 
 class StructureAwareChunker:
     """Assemble natural content blocks into bounded retrieval chunks."""
@@ -441,7 +466,7 @@ class StructureAwareChunker:
         self.overlap_chars = overlap_chars
         self.min_chunk_chars = min_chunk_chars
         self.exclude_references = exclude_references
-
+    
     def chunk_sections(
         self,
         sections: Iterable[Section],
@@ -454,13 +479,22 @@ class StructureAwareChunker:
         extractor = BlockExtractor()
 
         for section in sections:
-            normalized_title = section.title.strip().lower()
+            section_title = _normalize_section_title(section.title)
+            normalized_title = section_title.lower()
+
             if self.exclude_references and normalized_title in {
-                "references", "bibliography", "references and notes",
-            }:
-                continue
-            if normalized_title in {"acknowledgements", "acknowledgments", "contents"}:
-                continue
+                "references",
+                "bibliography",
+                "references and notes",
+                }:
+                    continue
+
+            if normalized_title in {
+                "acknowledgements",
+                "acknowledgments",
+                "contents",
+                }:
+                    continue
 
             blocks = extractor.extract(section)
             assembled = self._assemble(blocks)
@@ -470,11 +504,11 @@ class StructureAwareChunker:
                     continue
 
                 metadata = {
-                    **base_metadata,
-                    "section": section.title,
-                    "section_level": str(section.level),
-                    "content_type": self._content_type(types),
-                }
+                            **base_metadata,
+                            "section": section_title,
+                            "section_level": str(section.level),
+                            "content_type": self._content_type(types),
+                            }
                 if section.number:
                     metadata["section_number"] = section.number
                 if page_start is not None:
