@@ -17,11 +17,7 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
 # Data models
-# ---------------------------------------------------------------------------
-
 @dataclass
 class RawDocument:
     text: str
@@ -54,11 +50,6 @@ class DocumentChunk:
     source: str
     chunk_id: int
     metadata: dict[str, str] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
 
 class TextFileLoader:
     """Load all non-empty TXT research papers from a directory."""
@@ -98,11 +89,7 @@ class TextFileLoader:
         """Backward-compatible interface used by the original project."""
         return [(d.text, d.source) for d in self.load_documents(data_dir)]
 
-
-# ---------------------------------------------------------------------------
 # Marker cleaning
-# ---------------------------------------------------------------------------
-
 class MarkerCleaner:
     """Remove Marker-only syntax while preserving Markdown/scientific text."""
 
@@ -138,11 +125,7 @@ class MarkerCleaner:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-
-# ---------------------------------------------------------------------------
 # Section parsing
-# ---------------------------------------------------------------------------
-
 class SectionParser:
     """Detect Markdown, numbered, uppercase and simple bold headings."""
 
@@ -246,11 +229,7 @@ class SectionParser:
             return False
         return True
 
-
-# ---------------------------------------------------------------------------
 # Front matter
-# ---------------------------------------------------------------------------
-
 class FrontMatterFilter:
     """Remove author/affiliation/email noise before the abstract."""
 
@@ -260,8 +239,10 @@ class FrontMatterFilter:
         "university", "institute", "laboratory", "department", "nvidia",
         "google", "microsoft", "openai", "facebook", "meta", "ibm",
     )
-    
-    def filter(self, sections: list[Section], title: str | None = None, ) -> list[Section]:
+
+    def filter(
+        self, sections: list[Section], title: str | None = None
+    ) -> list[Section]:
         result: list[Section] = []
         for section in sections:
             if section.title != "Front Matter":
@@ -271,13 +252,10 @@ class FrontMatterFilter:
             kept: list[str] = []
             for paragraph in re.split(r"\n\s*\n", section.text):
                 p = paragraph.strip()
-
                 if not p:
                     continue
-
                 if title and " ".join(p.split()) == " ".join(title.split()):
                     continue
-
                 if self._is_noise(p):
                     continue
                 kept.append(p)
@@ -295,40 +273,24 @@ class FrontMatterFilter:
                 )
         return result
 
-    @staticmethod
-    def _is_noise(text: str) -> bool:
+    def _is_noise(self, text: str) -> bool:
         compact = " ".join(text.split())
-
-        if not compact:
-            return True
-
-        # Isolated Markdown artifacts.
         if re.fullmatch(r"#{1,6}", compact):
             return True
-
-        # Isolated punctuation / table remnants.
-        if re.fullmatch(r"[-–—|*_~•·.]+", compact):
+        if self.EMAIL_RE.search(compact):
+            return True
+        if self.URL_RE.fullmatch(compact):
             return True
 
-        # Isolated email.
-        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", compact):
-            return True
-
-        # Isolated URL.
-        if re.fullmatch(
-            r"(?:https?://|www\.)\S+",
-            compact,
-            re.IGNORECASE,
-        ):
-            return True
-
+        words = compact.split()
+        lower = compact.lower()
+        if len(words) <= 12 and any(term in lower for term in self.AFFILIATION_TERMS):
+            # Preserve actual sentences that merely mention an institution.
+            if not re.search(r"[.!?]", compact):
+                return True
         return False
 
-
-# ---------------------------------------------------------------------------
 # Block extraction
-# ---------------------------------------------------------------------------
-
 class BlockExtractor:
     """Extract paragraphs, tables, captions and page-aware blocks."""
 
@@ -426,6 +388,8 @@ class BlockExtractor:
             return True
         if re.fullmatch(r"#{1,6}", compact):
             return True
+        if re.fullmatch(r"[-–—|*_~•·.]+", compact):
+            return True
         if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", compact):
             return True
         if re.fullmatch(r"(?:https?://|www\.)\S+", compact, re.IGNORECASE):
@@ -433,16 +397,14 @@ class BlockExtractor:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Chunk assembly
-# ---------------------------------------------------------------------------
+# Section-title normalization
 def _normalize_section_title(title: str) -> str:
-    """Normalize formatting for section comparisons and metadata."""
+    """Normalize Markdown formatting for section comparisons and metadata."""
     title = re.sub(r"[*_`]+", "", title)
     title = re.sub(r"\s+", " ", title)
     return title.strip()
 
-
+# Chunk assembly
 class StructureAwareChunker:
     """Assemble natural content blocks into bounded retrieval chunks."""
 
@@ -466,7 +428,7 @@ class StructureAwareChunker:
         self.overlap_chars = overlap_chars
         self.min_chunk_chars = min_chunk_chars
         self.exclude_references = exclude_references
-    
+
     def chunk_sections(
         self,
         sections: Iterable[Section],
@@ -481,20 +443,12 @@ class StructureAwareChunker:
         for section in sections:
             section_title = _normalize_section_title(section.title)
             normalized_title = section_title.lower()
-
             if self.exclude_references and normalized_title in {
-                "references",
-                "bibliography",
-                "references and notes",
-                }:
-                    continue
-
-            if normalized_title in {
-                "acknowledgements",
-                "acknowledgments",
-                "contents",
-                }:
-                    continue
+                "references", "bibliography", "references and notes",
+            }:
+                continue
+            if normalized_title in {"acknowledgements", "acknowledgments", "contents"}:
+                continue
 
             blocks = extractor.extract(section)
             assembled = self._assemble(blocks)
@@ -504,11 +458,11 @@ class StructureAwareChunker:
                     continue
 
                 metadata = {
-                            **base_metadata,
-                            "section": section_title,
-                            "section_level": str(section.level),
-                            "content_type": self._content_type(types),
-                            }
+                    **base_metadata,
+                    "section": section_title,
+                    "section_level": str(section.level),
+                    "content_type": self._content_type(types),
+                }
                 if section.number:
                     metadata["section_number"] = section.number
                 if page_start is not None:
@@ -559,7 +513,7 @@ class StructureAwareChunker:
             # back to a word boundary split.
             if len(text) > self.max_chars and block.content_type == "table":
                 flush()
-                for piece in self._split_long_text(text):
+                for piece in self._split_table(text, self.max_chars):
                     results.append((piece, ["table"], block.page_start, block.page_end))
                 continue
 
@@ -576,7 +530,48 @@ class StructureAwareChunker:
                 flush()
 
         flush()
-        return self._merge_short(results)
+        merged = self._merge_short(results)
+        return self._enforce_max_size(merged)
+
+    def _enforce_max_size(
+        self, chunks
+    ):
+        """Final safety check: no retrieval chunk exceeds max_chars."""
+        final = []
+        for text, types, start, end in chunks:
+            if len(text) <= self.max_chars:
+                final.append((text, types, start, end))
+            else:
+                for piece in self._split_long_text(text):
+                    final.append((piece, types, start, end))
+        return final
+
+    def _split_table(
+        self, table_text: str, max_chars: int
+    ) -> list[str]:
+        """Split large Markdown tables by rows while repeating the header."""
+        lines = [line.strip() for line in table_text.splitlines() if line.strip()]
+        if len(lines) <= 2:
+            return self._split_long_text(table_text)
+
+        header, separator, *rows = lines
+        pieces = []
+        current = [header, separator]
+        current_len = len(header) + len(separator) + 2
+
+        for row in rows:
+            added = len(row) + 1
+            if len(current) > 2 and current_len + added > max_chars:
+                pieces.append("\n".join(current))
+                current = [header, separator, row]
+                current_len = len(header) + len(separator) + len(row) + 2
+            else:
+                current.append(row)
+                current_len += added
+
+        if len(current) > 2:
+            pieces.append("\n".join(current))
+        return pieces
 
     def _merge_short(self, chunks):
         """Merge short chunks with neighbors instead of deleting them."""
@@ -635,11 +630,7 @@ class StructureAwareChunker:
         unique = list(dict.fromkeys(types))
         return unique[0] if len(unique) == 1 else "mixed"
 
-
-# ---------------------------------------------------------------------------
 # High-level processor
-# ---------------------------------------------------------------------------
-
 class DocumentProcessor:
     """Process a directory of Marker TXT papers into retrieval chunks."""
 
@@ -674,7 +665,10 @@ class DocumentProcessor:
         for document in documents:
             cleaned = self.cleaner.clean(document.text)
             sections = self.parser.parse(cleaned)
-            sections = self.front_matter.filter(sections)
+            sections = self.front_matter.filter(
+                sections,
+                title=document.metadata.get("title"),
+            )
 
             all_chunks.extend(
                 self.chunker.chunk_sections(
@@ -694,11 +688,7 @@ class DocumentProcessor:
         )
         return all_chunks
 
-
-# ---------------------------------------------------------------------------
 # Backward-compatible wrapper
-# ---------------------------------------------------------------------------
-
 class DocumentChunker:
     """Compatibility wrapper for the original public API."""
 
@@ -717,11 +707,7 @@ class DocumentChunker:
         )
         return self._processor.chunker.chunk_sections(sections, source)
 
-
-# ---------------------------------------------------------------------------
 # Metadata helpers
-# ---------------------------------------------------------------------------
-
 def _extract_paper_metadata(text: str, source: str) -> dict[str, str]:
     metadata = {"source_id": source}
     lines = [line.strip() for line in text.splitlines() if line.strip()]
