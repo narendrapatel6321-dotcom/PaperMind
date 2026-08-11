@@ -39,7 +39,7 @@ class RAGConfig(BaseSettings):
     # Embedding
     # ------------------------------------------------------------------
 
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_model: str = "intfloat/e5-small-v2"
     embedding_batch_size: int = 32
     embedding_device: str | None = None
 
