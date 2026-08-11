@@ -66,7 +66,9 @@ class RAGPipeline:
 
         self.embedder = TextEmbedder(
             model_name=config.embedding_model,
-        )
+            batch_size=config.embedding_batch_size,
+            device=config.embedding_device,
+            )
 
         self.vector_store = FAISSVectorStore()
 
