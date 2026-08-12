@@ -164,7 +164,29 @@ class RAGGenerator:
         self._pipeline = pipeline(**pipeline_kwargs)
 
         logger.info("Generation model ready.")
+        
+    def _max_context_length(self) -> int | None:
+        """Best-effort lookup of the model's max context window in tokens.
 
+        Returns None if no reliable limit can be determined, in which case
+        the length guard in generate() is skipped.
+        """
+        model_config = getattr(self._pipeline.model, "config", None)
+
+        for attr in ("max_position_embeddings", "n_positions", "seq_length"):
+            value = getattr(model_config, attr, None)
+            if isinstance(value, int) and 0 < value < 1_000_000:
+                return value
+
+        tokenizer_limit = getattr(
+            self._pipeline.tokenizer, "model_max_length", None
+            )
+
+        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
+            return tokenizer_limit
+
+        return None
+            
     def generate(self, prompt: str) -> str:
         """Generate an answer from a complete RAG prompt.
 
