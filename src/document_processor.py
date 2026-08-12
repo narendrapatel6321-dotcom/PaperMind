@@ -744,7 +744,7 @@ class DocumentProcessor:
 class DocumentChunker:
     """Compatibility wrapper for the original public API."""
 
-    def __init__(self, chunk_size: int = 1500, chunk_overlap: int = 200):
+    def __init__(self, chunk_size: int = 1500):
         self._processor = DocumentProcessor(
             target_chars=chunk_size,
             max_chars=max(chunk_size, 2400),
