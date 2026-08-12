@@ -220,6 +220,23 @@ class RAGGenerator:
         elif tokenizer.eos_token_id is not None:
             generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
 
+        max_context = self._max_context_length()
+
+        if max_context is not None:
+            prompt_token_count = len(tokenizer.encode(prompt))
+            available_for_prompt = max_context - self.max_new_tokens
+
+            if prompt_token_count > available_for_prompt:
+                raise ValueError(
+                    "Prompt is too long for this model's context window: "
+                    f"{prompt_token_count} prompt tokens + "
+                    f"{self.max_new_tokens} max_new_tokens exceeds the "
+                    f"model's limit of {max_context} tokens "
+                    f"({prompt_token_count - available_for_prompt} tokens "
+                    "over budget). Reduce top_k, chunk size, or "
+                    "max_new_tokens."
+                )
+
         try:
             outputs = self._pipeline(
                 prompt,
