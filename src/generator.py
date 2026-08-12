@@ -220,10 +220,31 @@ class RAGGenerator:
         elif tokenizer.eos_token_id is not None:
             generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
 
+        # Instruct-tuned models are fine-tuned on a chat template (system/
+        # user/assistant turns). Use it when available so the model gets the
+        # input format it was actually trained on; fall back to the raw
+        # prompt string for base/non-chat models.
+        use_chat_template = bool(getattr(tokenizer, "chat_template", None))
+
+        if use_chat_template:
+            model_input = [{"role": "user", "content": prompt}]
+        else:
+            model_input = prompt
+
         max_context = self._max_context_length()
 
         if max_context is not None:
-            prompt_token_count = len(tokenizer.encode(prompt))
+            if use_chat_template:
+                prompt_token_count = len(
+                    tokenizer.apply_chat_template(
+                        model_input,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                    )
+                )
+            else:
+                prompt_token_count = len(tokenizer.encode(prompt))
+
             available_for_prompt = max_context - self.max_new_tokens
 
             if prompt_token_count > available_for_prompt:
@@ -239,7 +260,7 @@ class RAGGenerator:
 
         try:
             outputs = self._pipeline(
-                prompt,
+                model_input,
                 **generation_kwargs,
             )
         except Exception as exc:
