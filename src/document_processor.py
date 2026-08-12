@@ -464,20 +464,16 @@ class StructureAwareChunker:
         self,
         target_chars: int = 1500,
         max_chars: int = 2400,
-        overlap_chars: int = 200,
         min_chunk_chars: int = 150,
         exclude_references: bool = True,
     ) -> None:
         if target_chars <= 0 or max_chars < target_chars:
             raise ValueError("Require 0 < target_chars <= max_chars")
-        if overlap_chars < 0 or overlap_chars >= target_chars:
-            raise ValueError("overlap_chars must be >= 0 and < target_chars")
         if min_chunk_chars < 0:
             raise ValueError("min_chunk_chars must be >= 0")
 
         self.target_chars = target_chars
         self.max_chars = max_chars
-        self.overlap_chars = overlap_chars
         self.min_chunk_chars = min_chunk_chars
         self.exclude_references = exclude_references
 
@@ -696,7 +692,6 @@ class DocumentProcessor:
         self,
         target_chars: int = 1500,
         max_chars: int = 2400,
-        overlap_chars: int = 200,
         min_chunk_chars: int = 150,
         exclude_references: bool = True,
     ) -> None:
@@ -707,7 +702,6 @@ class DocumentProcessor:
         self.chunker = StructureAwareChunker(
             target_chars=target_chars,
             max_chars=max_chars,
-            overlap_chars=overlap_chars,
             min_chunk_chars=min_chunk_chars,
             exclude_references=exclude_references,
         )
@@ -754,7 +748,6 @@ class DocumentChunker:
         self._processor = DocumentProcessor(
             target_chars=chunk_size,
             max_chars=max(chunk_size, 2400),
-            overlap_chars=min(chunk_overlap, max(0, chunk_size // 4)),
             min_chunk_chars=150,
         )
 
