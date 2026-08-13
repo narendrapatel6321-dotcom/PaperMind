@@ -13,9 +13,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from document_processor import DocumentChunk
-from embedder import TextEmbedder
-from vector_store import FAISSVectorStore
+from src.document_processor import DocumentChunk
+from src.embedder import TextEmbedder
+from src.vector_store import FAISSVectorStore
 
 logger = logging.getLogger(__name__)
 
