@@ -1,0 +1,19 @@
+# --- Core pipeline (config.py, document_processor.py) ---
+pydantic-settings>=2.0
+ 
+# --- Vector store (vector_store.py) ---
+faiss-cpu>=1.7.4
+numpy>=1.24
+ 
+# --- Embedding (embedder.py) ---
+sentence-transformers>=2.7
+ 
+# --- Generation (generator.py) ---
+transformers>=4.44
+torch>=2.1
+accelerate>=0.30
+sentencepiece>=0.2.0
+ 
+# --- Notebook-only (config comparison harness, sweeps) ---
+pandas>=2.0
+ 
