@@ -23,15 +23,11 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from retriever import RetrievedContext
+from src.retriever import RetrievedContext
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
 # Text utilities
-# ---------------------------------------------------------------------------
-
 _STOPWORDS = frozenset(
     {
         "what",
@@ -74,7 +70,6 @@ _STOPWORDS = frozenset(
     }
 )
 
-
 def _content_words(text: str) -> set[str]:
     """Return lowercase content words from text."""
     tokens = set(re.findall(r"\b[a-z]{2,}\b", text.lower()))
@@ -85,12 +80,7 @@ def _normalize_answer(text: str) -> list[str]:
     """Tokenize text for answer-level evaluation."""
     return re.findall(r"\b[a-z0-9]+\b", text.lower())
 
-
-# ---------------------------------------------------------------------------
 # Retrieval result
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RetrievalMetrics:
     """Aggregate retrieval metrics for an evaluation set."""
@@ -114,11 +104,7 @@ class RetrievalMetrics:
         }
 
 
-# ---------------------------------------------------------------------------
 # Retrieval evaluator
-# ---------------------------------------------------------------------------
-
-
 class RetrievalEvaluator:
     """Evaluate retrieval quality against manually labelled ground truth."""
 
@@ -274,12 +260,7 @@ class RetrievalEvaluator:
             4,
         )
 
-
-# ---------------------------------------------------------------------------
 # Answer evaluator
-# ---------------------------------------------------------------------------
-
-
 class AnswerEvaluator:
     """Evaluate generated answers against retrieved context or references."""
 
