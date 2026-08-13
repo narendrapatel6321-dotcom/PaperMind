@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from retriever import RetrievedContext
+from src.retriever import RetrievedContext
 
 logger = logging.getLogger(__name__)
 
